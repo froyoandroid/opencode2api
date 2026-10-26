@@ -613,6 +613,12 @@ func prepareAnonymousBody(body []byte, protocol wire.Protocol, v1 bool) ([]byte,
 	if !v1 && protocol == wire.Chat && ensureV2CompletionLimit(payload) {
 		changed = true
 	}
+	if protocol == wire.Responses {
+		if _, ok := payload["tool_choice"]; !ok {
+			payload["tool_choice"] = "auto"
+			changed = true
+		}
+	}
 	if !changed {
 		return body, renames
 	}

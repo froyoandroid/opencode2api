@@ -25,8 +25,13 @@ var opencodePromptV1 string
 var opencodePromptV2 string
 
 // opencodePromptMarker identifies a body that already carries the official CLI
-// system prompt, so a client that sends it itself is left alone.
+// system prompt, so a client that sends it itself is left alone. Each lane's
+// prompt begins with a distinct marker: the v1 CLI text for /zen, and the v2.1
+// harness text for /inference and /zen/go.
 const opencodePromptMarker = "You are opencode, an interactive CLI tool"
+
+// opencodePromptMarkerV2 is the first line of the captured v2.1 harness prompt.
+const opencodePromptMarkerV2 = "You are an AI agent running in OpenCode"
 
 // opencodeSkills is the built-in skill listing the CLI appends after its
 // environment block. It is static, so it is part of the injected prompt.
@@ -45,20 +50,23 @@ var (
 	opencodeWorkDir string
 )
 
+// resolveOpenCodeWorkDir resolves the working directory once per process; a
+// platform without one falls back to the official container path.
+func resolveOpenCodeWorkDir() {
+	directory := ""
+	if current, err := os.Getwd(); err == nil {
+		directory = filepath.Clean(strings.TrimSpace(current))
+	}
+	if directory == "" || directory == "." {
+		directory = "/workspace"
+	}
+	opencodeWorkDir = directory
+}
+
 // opencodeEnvironment renders the <env> block the CLI puts after its base
-// prompt. The working directory is resolved once per process; a platform
-// without one falls back to the official container path.
+// prompt. The working directory is resolved once per process.
 func opencodeEnvironment(model string) string {
-	opencodeEnvOnce.Do(func() {
-		directory := ""
-		if current, err := os.Getwd(); err == nil {
-			directory = filepath.Clean(strings.TrimSpace(current))
-		}
-		if directory == "" || directory == "." {
-			directory = "/workspace"
-		}
-		opencodeWorkDir = directory
-	})
+	opencodeEnvOnce.Do(resolveOpenCodeWorkDir)
 	apiModel := strings.TrimSpace(strings.TrimPrefix(model, "opencode/"))
 	if apiModel == "" {
 		apiModel = "unknown"
@@ -83,11 +91,27 @@ func opencodeEnvironment(model string) string {
 // opencodeSystemPrompt assembles the full CLI system prompt for model and the
 // upstream generation's tool naming.
 func opencodeSystemPrompt(model string, v1 bool) string {
-	base := opencodePromptV2
 	if v1 {
-		base = opencodePromptV1
+		return opencodePromptV1 + opencodeEnvironment(model) + "\n" + opencodeSkills
 	}
-	return base + opencodeEnvironment(model) + "\n" + opencodeSkills
+	return opencodeV2SystemPrompt(model)
+}
+
+// opencodeV2SystemPrompt renders the captured v2.1 harness prompt. The embedded
+// asset carries {{MODEL}}, {{DATE}} and {{WORKDIR}} placeholders for the three
+// variable pieces the CLI fills per session: the model identity block, today's
+// date, and the working directory.
+func opencodeV2SystemPrompt(model string) string {
+	id := strings.TrimSpace(strings.TrimPrefix(model, "opencode/"))
+	if id == "" {
+		id = "unknown"
+	}
+	opencodeEnvOnce.Do(resolveOpenCodeWorkDir)
+	prompt := opencodePromptV2
+	prompt = strings.ReplaceAll(prompt, "{{MODEL}}", id)
+	prompt = strings.ReplaceAll(prompt, "{{DATE}}", time.Now().UTC().Format("Mon Jan 02 2006"))
+	prompt = strings.ReplaceAll(prompt, "{{WORKDIR}}", opencodeWorkDir)
+	return prompt
 }
 
 // injectOfficialPrompt prepends the official CLI system prompt to a shaped
@@ -223,10 +247,10 @@ func textFragments(value any) []string {
 }
 
 // carriesOpenCodePrompt reports whether any text inside value already contains
-// the marker.
+// either official prompt marker.
 func carriesOpenCodePrompt(value any) bool {
 	for _, part := range textFragments(value) {
-		if strings.Contains(part, opencodePromptMarker) {
+		if strings.Contains(part, opencodePromptMarker) || strings.Contains(part, opencodePromptMarkerV2) {
 			return true
 		}
 	}

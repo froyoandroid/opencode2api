@@ -33,8 +33,8 @@ type opencodeToolDefinition struct {
 // because Go maps do not preserve it. Tool order is not validated upstream, but
 // keeping the captured order makes the wire body stable.
 var v2OfficialToolOrder = []string{
-	"edit", "execute", "glob", "grep", "question", "read", "shell",
-	"skill", "subagent", "webfetch", "websearch", "write", "patch",
+	"edit", "glob", "grep", "question", "read", "shell",
+	"skill", "subagent", "webfetch", "websearch", "write", "execute",
 }
 
 var (
@@ -135,12 +135,16 @@ func officialTool(protocol wire.Protocol, name string, v1 bool) map[string]any {
 			"input_schema": parameters,
 		}
 	default:
-		return map[string]any{
+		tool := map[string]any{
 			"type":        "function",
 			"name":        name,
 			"description": description,
 			"parameters":  parameters,
 		}
+		if !v1 {
+			tool["strict"] = false
+		}
+		return tool
 	}
 }
 
