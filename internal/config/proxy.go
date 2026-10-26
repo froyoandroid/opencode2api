@@ -10,29 +10,47 @@ import (
 )
 
 // ParseProxyEntry splits an optional dynamic-pool marker ("pool+" scheme prefix
-// or "#pool" URL fragment) from a configured proxy string and returns the clean
-// dial URL alongside whether the entry is a rotating proxy pool (such as Resin).
-func ParseProxyEntry(raw string) (clean string, pool bool) {
+// or "#pool" URL fragment) and an optional header-relay marker ("relay+" scheme
+// prefix or "#relay" URL fragment) from a configured proxy string and returns
+// the clean dial URL alongside whether the entry is a rotating proxy pool
+// (such as Resin) or a header-based forward relay (such as a Vercel relay).
+func ParseProxyEntry(raw string) (clean string, pool bool, relay bool) {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" || trimmed == "direct" {
-		return trimmed, false
+		return trimmed, false, false
 	}
 	lower := strings.ToLower(trimmed)
+	if strings.HasPrefix(lower, "relay+") {
+		trimmed = strings.TrimSpace(trimmed[len("relay+"):])
+		relay = true
+		lower = strings.ToLower(trimmed)
+	}
 	if strings.HasPrefix(lower, "pool+") {
 		trimmed = strings.TrimSpace(trimmed[len("pool+"):])
 		pool = true
 	}
 	if u, err := url.Parse(trimmed); err == nil && u.Host != "" {
-		if strings.EqualFold(strings.TrimSpace(u.Fragment), "pool") {
+		switch strings.ToLower(strings.TrimSpace(u.Fragment)) {
+		case "pool":
 			pool = true
 			u.Fragment = ""
 			trimmed = u.String()
+		case "relay":
+			relay = true
+			u.Fragment = ""
+			trimmed = u.String()
 		}
-	} else if idx := strings.LastIndex(trimmed, "#"); idx >= 0 && strings.EqualFold(strings.TrimSpace(trimmed[idx+1:]), "pool") {
-		pool = true
-		trimmed = strings.TrimSpace(trimmed[:idx])
+	} else if idx := strings.LastIndex(trimmed, "#"); idx >= 0 {
+		switch strings.ToLower(strings.TrimSpace(trimmed[idx+1:])) {
+		case "pool":
+			pool = true
+			trimmed = strings.TrimSpace(trimmed[:idx])
+		case "relay":
+			relay = true
+			trimmed = strings.TrimSpace(trimmed[:idx])
+		}
 	}
-	return trimmed, pool
+	return trimmed, pool, relay
 }
 
 // resolveProxyFiles trims cfg.Proxies in place and stores the runtime proxy
@@ -115,11 +133,11 @@ func uniqueProxyEntries(items []string) []string {
 	seen := make(map[string]struct{}, len(items))
 	pools := make(map[string]struct{}, len(items))
 	for _, item := range items {
-		key, pool := ParseProxyEntry(item)
+		key, pool, relay := ParseProxyEntry(item)
 		if key == "" {
 			continue
 		}
-		if pool {
+		if pool || relay {
 			if _, exists := pools[key]; exists {
 				continue
 			}

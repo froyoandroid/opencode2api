@@ -440,7 +440,7 @@ func (p *proxyTransports) healthCounts() (total, healthy int) {
 func transportPool(proxies []string, cfg config.PerformanceConfig, responseHeaderTimeout time.Duration) (*proxyTransports, error) {
 	p := &proxyTransports{items: make([]*proxyTransport, 0, len(proxies))}
 	for _, raw := range proxies {
-		clean, isPool := config.ParseProxyEntry(raw)
+		clean, isPool, isRelay := config.ParseProxyEntry(raw)
 		transport := http.DefaultTransport.(*http.Transport).Clone()
 		transport.MaxIdleConns = cfg.MaxIdleConns
 		transport.MaxIdleConnsPerHost = cfg.MaxIdleConnsPerHost
@@ -469,7 +469,9 @@ func transportPool(proxies []string, cfg config.PerformanceConfig, responseHeade
 			KeepAlive: 30 * time.Second,
 		}).DialContext
 		var proxyURL *url.URL
-		if clean == "direct" {
+		if clean == "direct" || isRelay {
+			// A relay is dialed directly and re-aimed by relayTransport, so it
+			// needs no CONNECT proxy on the base transports.
 			transport.Proxy = nil
 		} else {
 			u, err := url.Parse(clean)
@@ -490,7 +492,17 @@ func transportPool(proxies []string, cfg config.PerformanceConfig, responseHeade
 		if err != nil {
 			return nil, fmt.Errorf("proxy %s: %w", config.RedactURL(raw), err)
 		}
-		proxy := &proxyTransport{index: len(p.items), name: raw, pool: isPool, client: &http.Client{Transport: transport}, bun: &http.Client{Transport: bun}}
+		var clientRoundTripper http.RoundTripper = transport
+		var bunRoundTripper http.RoundTripper = bun
+		if isRelay {
+			relay, err := url.Parse(clean)
+			if err != nil {
+				return nil, fmt.Errorf("parse relay %s: %w", config.RedactURL(raw), err)
+			}
+			clientRoundTripper = newRelayTransport(transport, relay)
+			bunRoundTripper = newRelayTransport(bun, relay)
+		}
+		proxy := &proxyTransport{index: len(p.items), name: raw, pool: isPool, client: &http.Client{Transport: clientRoundTripper}, bun: &http.Client{Transport: bunRoundTripper}}
 		proxy.healthy.Store(true)
 		p.items = append(p.items, proxy)
 	}

@@ -212,16 +212,11 @@ const base62Alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrst
 // session passes the free tier's encoding check where the raw hash shape was
 // rejected with 403 FreeTierError.
 //
-// The timestamp must also stay plausible. The free tier derives a risk window
-// from it: a session dated more than about a year from now, in either
-// direction, is answered with HTTP 429 "Free usage limit reached" — the same
-// message a genuinely exhausted IP receives — so a hash-derived timestamp
-// (which landed in 1970) made every free request fail however many WARP exits
-// were rotated. The encoding below therefore draws the timestamp from a slow
-// clock instead of the hash: today's UTC midnight minus a hash-derived offset
-// of at most sessionTimestampWindow. The id stays stable for a whole day, which
-// is all the affinity a live conversation needs, and its date never leaves the
-// window the upstream accepts.
+// The timestamp must also stay recent. The free gate answers a session dated
+// more than a small window from now with HTTP 429 "Free usage limit reached"
+// — the same message a genuinely exhausted IP receives — so the timestamp is
+// drawn from the current minute rather than the hash. It stays stable across
+// a turn's requests while never leaving the window the upstream accepts.
 func CanonicalSessionID(signal string) string {
 	if isOfficialSessionID(signal) {
 		return signal
@@ -239,21 +234,19 @@ func isOfficialSessionID(signal string) bool {
 	return canonicalSessionPattern.MatchString(signal) && descendingTimePartPattern.MatchString(signal[4:16])
 }
 
-// sessionTimestampWindow bounds how far before today a synthesized session's
-// timestamp may fall. The upstream accepts a date roughly a year away in either
-// direction and rejects anything beyond with HTTP 429, so a month leaves room
-// for clock skew and long-lived processes while never approaching the edge.
-const sessionTimestampWindow = 30 * 24 * time.Hour
-
-// descendingTimePart renders a plausible recent timestamp in the official
-// client's Identifier.descending() layout: a 36-bit timestamp shifted into the
-// top of a 48-bit word, ORed with counter 1, then bitwise-NOT-ed so the low 12
-// hex digits read ffe. The hash only picks the offset within
-// sessionTimestampWindow; it never supplies the date itself.
+// descendingTimePart renders a plausible timestamp in the official client's
+// Identifier.descending() layout: a millisecond timestamp shifted into the top
+// of a 48-bit word, ORed with counter 1, then bitwise-NOT-ed so the low 12 hex
+// digits read ffe.
+//
+// The timestamp must stay close to the current millisecond. The upstream gate
+// answers a session dated more than a small window from now with HTTP 429
+// "Free usage limit reached" — the same message a genuinely exhausted IP
+// receives — so a timestamp drawn from the day's midnight minus a large offset
+// fails every time. Truncating now to a minute keeps the id stable across a
+// turn's requests while never leaving the accepted window.
 func descendingTimePart(now time.Time, hash []byte) string {
-	window := uint64(sessionTimestampWindow / time.Millisecond)
-	offset := (uint64(hash[0])<<24 | uint64(hash[1])<<16 | uint64(hash[2])<<8 | uint64(hash[3])) % window
-	base := now.UTC().Truncate(24 * time.Hour).Add(-time.Duration(offset) * time.Millisecond)
+	base := now.UTC()
 	current := uint64(base.UnixMilli())<<12 | 1
 	inverted := ^current & 0xFFFFFFFFFFFF
 	return hex.EncodeToString([]byte{

@@ -414,7 +414,7 @@ func Normalize(path string, cfg Config) (Config, error) {
 		if raw == "direct" {
 			continue
 		}
-		clean, _ := ParseProxyEntry(raw)
+		clean, _, _ := ParseProxyEntry(raw)
 		u, err := url.Parse(clean)
 		if err != nil || u.Host == "" {
 			return Config{}, fmt.Errorf("invalid proxy URL %q", RedactURL(raw))

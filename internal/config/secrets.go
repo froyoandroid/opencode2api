@@ -23,7 +23,7 @@ func MaskValue(value string) string {
 // replaced by "***". A pool entry gets a #pool fragment when it has none, and
 // an unparsable value becomes "<invalid>".
 func RedactURL(raw string) string {
-	clean, pool := ParseProxyEntry(raw)
+	clean, pool, relay := ParseProxyEntry(raw)
 	if clean != "" {
 		raw = clean
 	}
@@ -31,11 +31,15 @@ func RedactURL(raw string) string {
 	if err != nil {
 		return "<invalid>"
 	}
+	_ = relay
 	if u.User != nil {
 		u.User = url.User("***")
 	}
 	if pool && u.Fragment == "" {
 		u.Fragment = "pool"
+	}
+	if relay && u.Fragment == "" {
+		u.Fragment = "relay"
 	}
 	return u.String()
 }
@@ -79,7 +83,7 @@ func (r *Redactor) Replace(cfg Config) {
 	}
 	for _, value := range cfg.RuntimeProxies() {
 		if value != "direct" {
-			clean, _ := ParseProxyEntry(value)
+			clean, _, _ := ParseProxyEntry(value)
 			values = append(values, value, clean)
 			if parsed, err := url.Parse(clean); err == nil && parsed.User != nil {
 				values = append(values, parsed.User.Username())
