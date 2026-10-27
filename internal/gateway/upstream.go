@@ -343,7 +343,7 @@ func (g *Gateway) maxAnonymousExits() int {
 	return defaultMaxAnonymousExits
 }
 
-// doAnonymousUpstream walks the session's anonymous proxy cursor. Each static
+// doStaticAnonymousUpstream walks the session's anonymous proxy cursor. Each static
 // proxy is tried at most once, up to performance.max_anonymous_exits proxies;
 // rotating #pool proxies may be drawn again until Retry.MaxAttempts proxies
 // were used. For each proxy it tries the upstreams in anonymousUpstreams
@@ -355,9 +355,40 @@ func (g *Gateway) maxAnonymousExits() int {
 // control to the preferred authenticated tiers. It returns the last response
 // (body still open), else the last error, plus the number of attempts made.
 func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, bodies map[config.Tier][]byte, ids identity.RequestIDs, attemptOffset int) (*http.Response, error, int) {
-	if g.usesWARP(route.ID, config.TierZen, true) {
-		return g.doWarpAnonymousUpstream(ctx, route, bodies, ids, attemptOffset)
+	if !g.usesWARP(route.ID, config.TierZen, true) {
+		return g.doStaticAnonymousUpstream(ctx, route, bodies, ids, attemptOffset)
 	}
+	resp, err, attempts := g.doWarpAnonymousUpstream(ctx, route, bodies, ids, attemptOffset)
+	if err == nil && upstreamStatus(resp)/100 == 2 {
+		return resp, nil, attempts
+	}
+	// The free-model lane leaves through WARP, but the pool can be spent: no
+	// exit to lease, every exit cooling, or every exit answering the free
+	// tier's 429. A configured relay still has an independent route to the
+	// upstream, so hand the remainder of the attempt budget to the static
+	// walk instead of failing the request. Only relays qualify: plain
+	// "direct" shares this host's address, which is what WARP exists to avoid.
+	if !g.anonymous.HasRelay() {
+		return resp, err, attempts
+	}
+	// The WARP lane already recorded the failure that brought us here; do not
+	// trip the shared breaker before the fallback, or the static walk would be
+	// gated by the very failure it is meant to route around.
+	fallbackResp, fallbackErr, fallbackAttempts := g.doStaticAnonymousUpstream(ctx, route, bodies, ids, attemptOffset+attempts)
+	if fallbackResp != nil && upstreamStatus(fallbackResp)/100 == 2 {
+		return fallbackResp, nil, attempts + fallbackAttempts
+	}
+	if fallbackErr == nil && fallbackResp == nil {
+		return resp, err, attempts + fallbackAttempts
+	}
+	return fallbackResp, fallbackErr, attempts + fallbackAttempts
+}
+
+// doStaticAnonymousUpstream is the anonymous lane restricted to the configured
+// static proxy routes ("direct", relays, #pool entries). It is skipped while
+// the lane breaker holds the exit walk shut: poking a flagged upstream again
+// would only extend the block.
+func (g *Gateway) doStaticAnonymousUpstream(ctx context.Context, route models.Route, bodies map[config.Tier][]byte, ids identity.RequestIDs, attemptOffset int) (*http.Response, error, int) {
 	// The breaker holds the lane shut for an hour-scale window after repeated
 	// failures: poking a flagged upstream again would only extend the block.
 	if !g.anonymous.AllowAttempt() {

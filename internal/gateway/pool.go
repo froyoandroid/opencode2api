@@ -33,6 +33,7 @@ type proxyTransport struct {
 	index        int
 	name         string
 	pool         bool
+	relay        bool
 	client       *http.Client
 	bun          *http.Client
 	healthy      atomic.Bool
@@ -68,10 +69,11 @@ func (t *proxyTransport) markBlocked(until time.Time) {
 // cooldown per proxy. Unlike key nodes, anonymous nodes are never rebound:
 // changing proxy is the failover mechanism because Zen rate-limits them by IP.
 type anonymousNodes struct {
-	nodes    []*anonymousNode
-	next     atomic.Uint64
-	cooldown time.Duration
-	hasPool  bool
+	nodes      []*anonymousNode
+	next       atomic.Uint64
+	cooldown   time.Duration
+	hasPool    bool
+	transports *proxyTransports
 	// breaker stops the whole lane after repeated failures or when every
 	// exit is under the free tier's IP block: the lane then pauses for
 	// backoff.base, doubling every further trip (one strike per trip) up to
@@ -109,7 +111,7 @@ type anonymousCursor struct {
 // anonymousPool builds one anonymous node per proxy transport, or an empty
 // pool when the anonymous tier is disabled.
 func anonymousPool(enabled bool, transports *proxyTransports, cooldown time.Duration, backoff anonymousBackoff) *anonymousNodes {
-	pool := &anonymousNodes{cooldown: cooldown, backoff: backoff}
+	pool := &anonymousNodes{cooldown: cooldown, backoff: backoff, transports: transports}
 	if !enabled || transports == nil {
 		return pool
 	}
@@ -142,6 +144,16 @@ func (p *anonymousNodes) blockedExits(now time.Time) bool {
 		}
 	}
 	return true
+}
+
+// HasRelay reports whether any anonymous exit is a header-based forward relay.
+// A relay has its own route to the upstream, so it is the one static egress
+// worth falling back to when the WARP pool is spent.
+func (p *anonymousNodes) HasRelay() bool {
+	if p == nil || p.transports == nil {
+		return false
+	}
+	return p.transports.hasRelay()
 }
 
 // HasPool reports whether any node uses a rotating proxy pool (#pool), which
@@ -418,6 +430,21 @@ func (p *proxyTransports) hasHealthy() bool {
 	return false
 }
 
+// hasRelay reports whether any configured static route is a header-based
+// forward relay, which is what makes a static fallback worth attempting from
+// the WARP lane.
+func (p *proxyTransports) hasRelay() bool {
+	if p == nil {
+		return false
+	}
+	for _, item := range p.items {
+		if item.relay {
+			return true
+		}
+	}
+	return false
+}
+
 func (p *proxyTransports) healthCounts() (total, healthy int) {
 	if p == nil {
 		return 0, 0
@@ -502,7 +529,7 @@ func transportPool(proxies []string, cfg config.PerformanceConfig, responseHeade
 			clientRoundTripper = newRelayTransport(transport, relay)
 			bunRoundTripper = newRelayTransport(bun, relay)
 		}
-		proxy := &proxyTransport{index: len(p.items), name: raw, pool: isPool, client: &http.Client{Transport: clientRoundTripper}, bun: &http.Client{Transport: bunRoundTripper}}
+		proxy := &proxyTransport{index: len(p.items), name: raw, pool: isPool, relay: isRelay, client: &http.Client{Transport: clientRoundTripper}, bun: &http.Client{Transport: bunRoundTripper}}
 		proxy.healthy.Store(true)
 		p.items = append(p.items, proxy)
 	}
@@ -890,4 +917,11 @@ func parseRetryAfter(value string) time.Duration {
 		return max(time.Until(when), 0)
 	}
 	return 0
+}
+
+// AnonymousHasRelay reports whether the anonymous lane has a relay fallback.
+// It exists so operational checks can confirm the chain is wired without
+// sending a request.
+func (g *Gateway) AnonymousHasRelay() bool {
+	return g != nil && g.anonymous.HasRelay()
 }
