@@ -23,59 +23,85 @@ import (
 // http.DefaultTransport.
 const bunHandshakeTimeout = 10 * time.Second
 
-// bunClientHello returns the ClientHello of Bun's fetch, captured from Bun
-// 1.4.3. Bun links its own BoringSSL, so the hello is the same on every
-// platform: JA4 t13d1713h1, no GREASE, no padding, http/1.1 as the only ALPN
-// protocol and X25519MLKEM768 as the first key share. uTLS keeps handshake
-// state in the extensions, so every connection needs a fresh spec.
+// bunClientHello returns the ClientHello of Bun's fetch, captured on the wire
+// from the OpenCode CLI (opencode 2.1.4, which is a Bun 1.4 binary). Bun links
+// its own BoringSSL, so the hello is the same on every platform: no GREASE, no
+// padding, http/1.1 as the only ALPN protocol, X25519MLKEM768 as the first key
+// share of a 32-byte session id, and the extension order BoringSSL uses
+// (renegotiation first, then server name, then the rest in ascending id).
+// uTLS keeps handshake state in the extensions, so every connection needs a
+// fresh spec.
 func bunClientHello() *utls.ClientHelloSpec {
 	return &utls.ClientHelloSpec{
 		TLSVersMin: utls.VersionTLS12,
 		TLSVersMax: utls.VersionTLS13,
 		CipherSuites: []uint16{
-			utls.TLS_AES_128_GCM_SHA256,
 			utls.TLS_AES_256_GCM_SHA384,
 			utls.TLS_CHACHA20_POLY1305_SHA256,
-			utls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-			utls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+			utls.TLS_AES_128_GCM_SHA256,
 			utls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
 			utls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+			utls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+			utls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
 			utls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
 			utls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
-			utls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
-			utls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
-			utls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
-			utls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
-			utls.TLS_RSA_WITH_AES_128_GCM_SHA256,
-			utls.TLS_RSA_WITH_AES_256_GCM_SHA384,
-			utls.TLS_RSA_WITH_AES_128_CBC_SHA,
-			utls.TLS_RSA_WITH_AES_256_CBC_SHA,
+			utls.DISABLED_TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384,
+			utls.DISABLED_TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA384,
+			uint16(0xc023), // TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256
+			uint16(0xc027), // TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256
+			uint16(0x009f), // TLS_DHE_RSA_WITH_AES_256_GCM_SHA384
+			uint16(0x009e), // TLS_DHE_RSA_WITH_AES_128_GCM_SHA256
+			uint16(0x006b), // TLS_DHE_RSA_WITH_AES_256_CBC_SHA256
+			uint16(0x0067), // TLS_DHE_RSA_WITH_AES_128_CBC_SHA256
 		},
 		CompressionMethods: []uint8{0},
 		Extensions: []utls.TLSExtension{
-			&utls.SNIExtension{},
-			&utls.ExtendedMasterSecretExtension{},
 			&utls.RenegotiationInfoExtension{Renegotiation: utls.RenegotiateOnceAsClient},
-			&utls.SupportedCurvesExtension{Curves: []utls.CurveID{utls.X25519MLKEM768, utls.X25519, utls.CurveP256, utls.CurveP384}},
-			&utls.SupportedPointsExtension{SupportedPoints: []uint8{0}},
-			&utls.SessionTicketExtension{},
-			&utls.ALPNExtension{AlpnProtocols: []string{"http/1.1"}},
-			&utls.StatusRequestExtension{},
-			&utls.SignatureAlgorithmsExtension{SupportedSignatureAlgorithms: []utls.SignatureScheme{
-				utls.ECDSAWithP256AndSHA256,
-				utls.PSSWithSHA256,
-				utls.PKCS1WithSHA256,
-				utls.ECDSAWithP384AndSHA384,
-				utls.PSSWithSHA384,
-				utls.PKCS1WithSHA384,
-				utls.PSSWithSHA512,
-				utls.PKCS1WithSHA512,
-				utls.PKCS1WithSHA1,
+			// server_name: BoringSSL emits it second, sized for this host.
+			&utls.SNIExtension{},
+			&utls.GenericExtension{Id: 0x000b, Data: []byte{0x03, 0x00, 0x01, 0x02}}, // ec_point_formats
+			// supported_groups: x25519mlkem768, x25519, secp256r1, secp384r1,
+			// secp521r1(0x0019), ffdhe2048, ffdhe3072
+			&utls.GenericExtension{Id: 0x000a, Data: []byte{
+				0x00, 0x10,
+				0x11, 0xec, 0x00, 0x1d, 0x00, 0x17, 0x00, 0x1e,
+				0x00, 0x18, 0x00, 0x19, 0x01, 0x00, 0x01, 0x01,
 			}},
-			&utls.SCTExtension{},
-			&utls.KeyShareExtension{KeyShares: []utls.KeyShare{{Group: utls.X25519MLKEM768}, {Group: utls.X25519}}},
-			&utls.PSKKeyExchangeModesExtension{Modes: []uint8{utls.PskModeDHE}},
+			&utls.GenericExtension{Id: 0x0023},
+			&utls.ALPNExtension{AlpnProtocols: []string{"http/1.1"}},
+			&utls.GenericExtension{Id: 0x0016}, // encrypt_then_mac
+			&utls.GenericExtension{Id: 0x0017}, // extended_master_secret marker
+			&utls.SignatureAlgorithmsExtension{SupportedSignatureAlgorithms: []utls.SignatureScheme{
+				utls.SignatureScheme(0x0905),
+				utls.SignatureScheme(0x0906),
+				utls.SignatureScheme(0x0904),
+				utls.SignatureScheme(0x0403),
+				utls.SignatureScheme(0x0503),
+				utls.SignatureScheme(0x0603),
+				utls.SignatureScheme(0x0807),
+				utls.SignatureScheme(0x0808),
+				utls.SignatureScheme(0x081a),
+				utls.SignatureScheme(0x081b),
+				utls.SignatureScheme(0x081c),
+				utls.SignatureScheme(0x0809),
+				utls.SignatureScheme(0x080a),
+				utls.SignatureScheme(0x080b),
+				utls.SignatureScheme(0x0804),
+				utls.SignatureScheme(0x0805),
+				utls.SignatureScheme(0x0806),
+				utls.SignatureScheme(0x0401),
+				utls.SignatureScheme(0x0501),
+				utls.SignatureScheme(0x0601),
+				utls.SignatureScheme(0x0303),
+				utls.SignatureScheme(0x0301),
+				utls.SignatureScheme(0x0302),
+				utls.SignatureScheme(0x0402),
+				utls.SignatureScheme(0x0502),
+				utls.SignatureScheme(0x0602),
+			}},
 			&utls.SupportedVersionsExtension{Versions: []uint16{utls.VersionTLS13, utls.VersionTLS12}},
+			&utls.PSKKeyExchangeModesExtension{Modes: []uint8{utls.PskModeDHE}},
+			&utls.KeyShareExtension{KeyShares: []utls.KeyShare{{Group: utls.X25519MLKEM768}, {Group: utls.X25519}}},
 		},
 	}
 }

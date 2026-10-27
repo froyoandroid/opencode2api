@@ -361,7 +361,17 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 	}
 	resp, err, attempts := g.doWarpAnonymousUpstream(ctx, route, bodies, ids, attemptOffset)
 	if err == nil && upstreamStatus(resp)/100 == 2 {
+		// A success proves the bucket the exit drew on has reopened; the
+		// window recorded from an earlier exit no longer describes the lane.
+		g.anonymous.ClearQuota()
 		return resp, nil, attempts
+	}
+	// A quota 429 marks the bucket spent for the exits seen so far. The window
+	// stays advisory: the next request still leases an exit, because the WARP
+	// pool hands out a fresh address and only a dial can tell whether its
+	// bucket is spent too.
+	if g.anonymous.observeQuota(resp) {
+		return resp, err, attempts
 	}
 	// The free-model lane leaves through WARP, but the pool can be spent: no
 	// exit to lease, every exit cooling, or every exit answering the free
@@ -1096,6 +1106,15 @@ func (g *Gateway) observeAnonymousResult(ctx context.Context, node *anonymousNod
 			// An IP block is scoped to this exit; doAnonymousUpstream marks it
 			// blocked and opens the lane breaker only when no exit is left.
 			// Counting it here as well would stop the other exits early.
+			return
+		}
+		if g.anonymous.quotaClosed(resp) {
+			// A quota 429 is the free tier's daily bucket, not an upstream
+			// outage: it lifts on the upstream's own schedule, every exit and
+			// the official client are inside it, and no retry can shorten it.
+			// Counting it as a breaker strike would multiply the backoff to its
+			// 24h cap and hold the lane shut past the reset, which is exactly
+			// the failure the CLI does not have.
 			return
 		}
 		if pause, tripped := g.anonymous.NoteFailure(); tripped {
