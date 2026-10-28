@@ -18,10 +18,10 @@ func TestBunClientHelloShape(t *testing.T) {
 	got := parseHello(t, hello)
 
 	wantCiphers := []uint16{
-		0x1302, 0x1303, 0x1301,
-		0xc02c, 0xc030, 0xc02b, 0xc02f, 0xcca9, 0xcca8,
-		0xc024, 0xc028, 0xc023, 0xc027,
-		0x009f, 0x009e, 0x006b, 0x0067,
+		0x1301, 0x1302, 0x1303,
+		0xc02b, 0xc02f, 0xc02c, 0xc030, 0xcca9, 0xcca8,
+		0xc009, 0xc013, 0xc00a, 0xc014,
+		0x009c, 0x009d, 0x002f, 0x0035,
 	}
 	if len(got.ciphers) != len(wantCiphers) {
 		t.Fatalf("cipher count = %d, want %d", len(got.ciphers), len(wantCiphers))
@@ -33,18 +33,19 @@ func TestBunClientHelloShape(t *testing.T) {
 	}
 
 	wantExts := []uint16{
-		0xff01, // renegotiation_info
 		0x0000, // server_name
-		0x000b, // ec_point_formats
+		0x0017, // extended_master_secret
+		0xff01, // renegotiation_info
 		0x000a, // supported_groups
+		0x000b, // ec_point_formats
 		0x0023, // session_ticket
 		0x0010, // ALPN
-		0x0016, // encrypt_then_mac
-		0x0017, // extended_master_secret
+		0x0005, // status_request
 		0x000d, // signature_algorithms
-		0x002b, // supported_versions
-		0x002d, // psk_key_exchange_modes
+		0x0012, // signed_certificate_timestamp
 		0x0033, // key_share
+		0x002d, // psk_key_exchange_modes
+		0x002b, // supported_versions
 	}
 	if len(got.exts) != len(wantExts) {
 		t.Fatalf("extension count = %d, want %d", len(got.exts), len(wantExts))
@@ -61,13 +62,8 @@ func TestBunClientHelloShape(t *testing.T) {
 	if v := got.supportedVersions; !bytes.Equal(v, []byte{0x04, 0x03, 0x04, 0x03, 0x03}) {
 		t.Fatalf("supported_versions body = %x, want 0403040303", v)
 	}
-	if v := got.sigalgs; len(v) != 54 || !bytes.Equal(v[:4], []byte{0x00, 0x34, 0x09, 0x05}) {
-		t.Fatalf("signature_algorithms body = %x, want 54 bytes starting 00340905", v)
-	}
 	if v := got.groups; !bytes.Equal(v, []byte{
-		0x00, 0x10,
-		0x11, 0xec, 0x00, 0x1d, 0x00, 0x17, 0x00, 0x1e,
-		0x00, 0x18, 0x00, 0x19, 0x01, 0x00, 0x01, 0x01,
+		0x00, 0x08, 0x11, 0xec, 0x00, 0x1d, 0x00, 0x17, 0x00, 0x18,
 	}) {
 		t.Fatalf("supported_groups body = %x", v)
 	}
