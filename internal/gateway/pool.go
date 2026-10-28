@@ -81,11 +81,15 @@ type anonymousNodes struct {
 	// half-open attempt allowed after the window expires.
 	backoff      anonymousBackoff
 	breakerUntil atomic.Int64
-	// quotaUntil holds the reset instant last reported by a free-tier quota
-	// 429. It is advisory: the lane still leases an exit per request, because
-	// only a dial can tell whether that exit's bucket is also spent. Written
-	// by NoteQuotaClosed, cleared by ClearQuota once an exit succeeds.
-	quotaUntil     atomic.Int64
+	// quotaWindow holds the free-tier bucket verdict. The lane leases one exit
+	// per request while no window is known, because a quota 429 was documented
+	// as per address. It is not: every exit answers with a Retry-After landing
+	// in the same minute, so the bucket is shared by the whole anonymous lane
+	// and WARP rotation cannot escape it. Once sharedBucketExits exits agree,
+	// the lane stops spending leases until that minute passes. Written by
+	// NoteQuotaClosed, cleared by ClearQuota once an exit succeeds.
+	quotaMu        sync.Mutex
+	quotaWindow    quotaWindow
 	breakerStrikes atomic.Int32
 	consecutive    atomic.Int32
 	probing        atomic.Bool
@@ -234,44 +238,73 @@ func (p *anonymousNodes) NoteSuccess() {
 	p.probing.Store(false)
 }
 
-// NoteQuotaClosed records that the free-tier bucket the exiting address draws
-// on is spent until until, and returns the window now in force.
+// sharedBucketExits is how many distinct exits must answer with the same
+// free-tier quota window before the lane treats the bucket as shared.
 //
-// The window is advisory, never a veto. Upstream signals a spent bucket as a
-// timestamp (Retry-After), but the buckets are per address and the WARP pool
-// leases a new exit on demand, so a window recorded from one exit does not
-// prove the next one is spent. Answering from it without dialing turned a
-// reopened bucket into hours of avoidable 429s, so the lane still spends one
-// exit per request while the window is open: a success clears it, another
-// quota 429 extends it.
-func (p *anonymousNodes) NoteQuotaClosed(until time.Time) {
-	if p == nil || until.IsZero() {
-		return
-	}
-	deadline := until.UnixNano()
-	for {
-		cur := p.quotaUntil.Load()
-		if cur != 0 && cur >= deadline {
-			return
-		}
-		if p.quotaUntil.CompareAndSwap(cur, deadline) {
-			return
-		}
-	}
+// The window is the reset instant, and exits do not agree on it to the second:
+// a direct request counts down to local midnight, while a fresh WARP exit is
+// handed an escalating penalty tens of minutes later. What they share is the
+// day the quota reopens on, because the free tier is a daily allowance; the
+// exact second only matters for reporting. Comparison is therefore by UTC day.
+const sharedBucketExits = 3
+
+// quotaWindow is the stored shared-bucket verdict: the UTC day the bucket
+// reopens on, the latest reset instant reported for that day, and how many
+// distinct exits have reported it.
+type quotaWindow struct {
+	day    time.Time
+	reopen time.Time
+	exits  int32
 }
 
-// QuotaClosedUntil returns the instant the recorded free-tier quota window
-// reopens and whether the lane is currently inside that window. The window is
-// advisory: callers narrow the attempt budget, they do not skip the upstream.
+// NoteQuotaClosed records that the free tier's bucket is spent until until, and
+// reports whether another distinct exit still has to be tried.
+//
+// The bucket is shared: every exit answers with a Retry-After inside the same
+// UTC day, because the free tier is a daily allowance. Rotating exits therefore
+// cannot reopen it early, and doing so costs a WARP registration per attempt.
+// Only the first sharedBucketExits-1 rejections ask for another exit; after that
+// the window stops the lane until that day ends.
+func (p *anonymousNodes) NoteQuotaClosed(until time.Time) (tryAnotherExit bool) {
+	if p == nil || until.IsZero() {
+		return false
+	}
+	until = until.UTC()
+	day := until.Truncate(24 * time.Hour)
+	p.quotaMu.Lock()
+	defer p.quotaMu.Unlock()
+	switch {
+	case p.quotaWindow.day.IsZero() || !p.quotaWindow.day.Equal(day):
+		// A different day is a different window: either the first report, or
+		// a later one that supersedes it. Counting restarts against it.
+		p.quotaWindow = quotaWindow{day: day, reopen: until, exits: 1}
+	default:
+		p.quotaWindow.exits++
+		if until.After(p.quotaWindow.reopen) {
+			p.quotaWindow.reopen = until
+		}
+	}
+	return p.quotaWindow.exits < sharedBucketExits
+}
+
+// QuotaClosedUntil returns the reset instant the lane is waiting for and
+// whether enough exits have confirmed that the shared bucket is spent. A
+// window still being probed reports false, so the caller keeps the normal
+// attempt budget.
 func (p *anonymousNodes) QuotaClosedUntil(now time.Time) (time.Time, bool) {
 	if p == nil {
 		return time.Time{}, false
 	}
-	until := p.quotaUntil.Load()
-	if until == 0 || now.UnixNano() >= until {
+	p.quotaMu.Lock()
+	window := p.quotaWindow
+	p.quotaMu.Unlock()
+	if window.day.IsZero() || !now.UTC().Before(window.day.Add(24*time.Hour)) {
 		return time.Time{}, false
 	}
-	return time.Unix(0, until), true
+	if window.exits < sharedBucketExits {
+		return window.reopen, false
+	}
+	return window.reopen, true
 }
 
 // ClearQuota drops the recorded quota window after an exit proved the bucket
@@ -280,29 +313,32 @@ func (p *anonymousNodes) ClearQuota() {
 	if p == nil {
 		return
 	}
-	p.quotaUntil.Store(0)
+	p.quotaMu.Lock()
+	p.quotaWindow = quotaWindow{}
+	p.quotaMu.Unlock()
 }
 
-// observeQuota records a free-tier quota 429 on the lane. It reports whether
-// the response is that quota rejection, which is distinct from the per-exit IP
-// block the walk already handles.
-func (p *anonymousNodes) observeQuota(resp *http.Response) bool {
+// observeQuotaWindow records a free-tier quota 429 and returns the instant the
+// shared bucket reopens plus whether another exit should still be tried.
+func (p *anonymousNodes) observeQuotaWindow(resp *http.Response) (time.Time, bool) {
 	if resp == nil || resp.StatusCode != http.StatusTooManyRequests {
-		return false
+		return time.Time{}, false
 	}
 	if !isFreeUsageLimit(resp) {
-		return false
+		return time.Time{}, false
 	}
-	if delay := parseRetryAfter(resp.Header.Get("Retry-After")); delay > 0 {
-		p.NoteQuotaClosed(time.Now().Add(delay))
+	delay := parseRetryAfter(resp.Header.Get("Retry-After"))
+	if delay <= 0 {
+		return time.Time{}, false
 	}
-	return true
+	until := time.Now().Add(delay)
+	return until, p.NoteQuotaClosed(until)
 }
 
 // quotaClosed reports whether resp is the free tier's quota rejection without
-// recording its window. observeQuota already ran on this response by the time
-// the breaker decides whether to count a strike, so this only answers the
-// question: a quota 429 is the upstream's problem, not this lane's.
+// recording its window. The walk already recorded it by the time the breaker
+// decides whether to count a strike, so this only answers the question: a
+// quota 429 is the upstream's problem, not this lane's.
 func (p *anonymousNodes) quotaClosed(resp *http.Response) bool {
 	if resp == nil || resp.StatusCode != http.StatusTooManyRequests {
 		return false

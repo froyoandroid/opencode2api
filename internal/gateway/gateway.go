@@ -370,6 +370,16 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 				wire.WriteError(w, external, http.StatusServiceUnavailable, anonymousLanePausedMessage, "free_tier_lane_paused", ids.Request)
 				return
 			}
+			// The free tier's daily bucket is spent for every exit. Report the
+			// reset instant instead of a generic 502, which would invite a
+			// retry that cannot succeed, and instead of the IP-block message,
+			// which would send the operator hunting for another egress that
+			// draws on the same spent bucket.
+			if errors.Is(err, errSharedQuotaClosed) {
+				until, _ := g.anonymous.QuotaClosedUntil(time.Now())
+				wire.WriteError(w, external, http.StatusTooManyRequests, sharedQuotaClosedMessage(until), "free_tier_quota_closed", ids.Request)
+				return
+			}
 			wire.WriteError(w, external, http.StatusBadGateway, "all upstream attempts failed", "upstream_error", ids.Request)
 			return
 		}

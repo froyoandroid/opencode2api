@@ -17,6 +17,22 @@ import (
 // and the exit must stay out of the cursor until the block expires.
 var errFreeTierIPBlocked = errors.New("free tier blocked the egress IP")
 
+// errSharedQuotaClosed reports that the free tier's daily quota, which every
+// anonymous exit draws on, is spent until the reset instant reported by
+// Retry-After. Rotating exits cannot help: distinct exits on unrelated
+// networks answer with the same countdown. The caller reports the reset to the
+// client instead of walking more egresses.
+var errSharedQuotaClosed = errors.New("free tier daily quota is spent")
+
+// sharedQuotaClosedMessage is what a client receives while the free tier's
+// daily bucket is spent. It names the reset instant, because that is the only
+// thing that reopens the lane, and states that another exit will not.
+func sharedQuotaClosedMessage(until time.Time) string {
+	return "OpenCode's free-model quota is spent for the current window (it resets at " +
+		until.UTC().Format(time.RFC3339) +
+		"). Every egress draws on the same free bucket, so rotating the exit cannot help and retrying before the reset cannot succeed."
+}
+
 // freeTierBlockedMessage is what a client receives while its exit is blocked.
 // The upstream message tells people to turn off a VPN, which is wrong for a
 // server that egresses through a proxy; this one names the real cause and the

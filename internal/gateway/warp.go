@@ -227,6 +227,13 @@ func (g *Gateway) doWarpAnonymousUpstream(ctx context.Context, route models.Rout
 		return nil, errAnonymousLanePaused, 0
 	}
 	defer g.anonymous.ReleaseProbe()
+	// Every exit draws on one free-tier bucket, so once enough of them have
+	// reported the same quota window no lease can succeed before it expires.
+	// Answering from the recorded window costs nothing; spending a WARP
+	// registration per attempt to learn the same thing again does.
+	if _, closed := g.anonymous.QuotaClosedUntil(time.Now()); closed {
+		return nil, errSharedQuotaClosed, 0
+	}
 	rawBody := bodies[config.TierZen]
 	if len(rawBody) == 0 {
 		return nil, errors.New("no prepared Zen request body"), 0
@@ -311,6 +318,16 @@ func (g *Gateway) doWarpAnonymousUpstream(ctx context.Context, route models.Rout
 				lastErr = errDeterministicClientRejection
 				halted = true
 				g.logger.Warn("upstream rejected the request; not trying other upstreams", "component", "upstream", "event", "deterministic_rejection", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "upstream", config.RedactURL(baseURL), "status", status, "duration_ms", duration.Milliseconds())
+				break
+			}
+			// A quota 429 is the shared bucket, not this exit. Once enough
+			// distinct exits agree on the window, stop leasing: the next
+			// attempt would only spend a registration to be told the same
+			// reset instant.
+			if until, tryAnother := g.anonymous.observeQuotaWindow(resp); !tryAnother && !until.IsZero() {
+				lastErr = errSharedQuotaClosed
+				halted = true
+				g.logger.Info("anonymous free-tier bucket is spent; pausing the lane until it reopens", "component", "upstream", "event", "free_tier_quota_closed", "request_id", ids.Request, "attempt", attempts, "status", status, "reopens_at", until.UTC().Format(time.RFC3339))
 				break
 			}
 			g.logger.Debug("anonymous WARP upstream returned an error response; trying the next upstream or exit", "component", "upstream", "event", "anonymous_attempt_response_failed", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "upstream", config.RedactURL(baseURL), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", egress, "status", status, "duration_ms", duration.Milliseconds())

@@ -366,11 +366,20 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 		g.anonymous.ClearQuota()
 		return resp, nil, attempts
 	}
-	// A quota 429 marks the bucket spent for the exits seen so far. The window
-	// stays advisory: the next request still leases an exit, because the WARP
-	// pool hands out a fresh address and only a dial can tell whether its
-	// bucket is spent too.
-	if g.anonymous.observeQuota(resp) {
+	// Every exit draws on the same free-tier bucket, so the WARP walk records
+	// the quota window as it goes. A shared window is terminal: a relay or the
+	// direct route reaches the same bucket, so walking them only spends the
+	// rest of the attempt budget to hear the same reset instant.
+	if errors.Is(err, errSharedQuotaClosed) {
+		return nil, err, attempts
+	}
+	// The free-model lane leaves through WARP, but the pool can be spent: no
+	// exit to lease, every exit cooling, or every exit answering the free
+	// tier's 429. A configured relay still has an independent route to the
+	// upstream, so hand the remainder of the attempt budget to the static
+	// walk instead of failing the request. Only relays qualify: plain
+	// "direct" shares this host's address, which is what WARP exists to avoid.
+	if !g.anonymous.HasRelay() {
 		return resp, err, attempts
 	}
 	// The free-model lane leaves through WARP, but the pool can be spent: no
