@@ -375,7 +375,9 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 	// then reports errDeterministicClientRejection so the caller keeps this
 	// 4xx instead of replacing it with a later tier's answer.
 	halted := false
-	cursor := g.anonymous.CursorFor(ids.Session)
+	// A retry pass starts one exit further along than the pass that just
+	// failed, so the walk does not open on the exit that refuses.
+	cursor := g.anonymous.CursorForOffset(ids.Session, attemptOffset)
 	limit := min(g.anonymous.Len(), g.maxAnonymousExits())
 	if g.anonymous.HasPool() && g.cfg.Retry.MaxAttempts > limit {
 		limit = g.cfg.Retry.MaxAttempts

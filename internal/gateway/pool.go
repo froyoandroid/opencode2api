@@ -94,6 +94,11 @@ type anonymousNode struct {
 	proxy         *proxyTransport
 	failures      atomic.Uint32
 	cooldownUntil atomic.Int64
+	// quotaCooldown marks a cooldown set from an upstream Retry-After. Such a
+	// cooldown is the free tier's own quota answer for this egress, so a
+	// recovered proxy route must not clear it: the exit would be tried again
+	// before its allowance refills and only spend another answer.
+	quotaCooldown atomic.Bool
 }
 
 // anonymousCursor walks the anonymous nodes for one request from start;
@@ -154,6 +159,13 @@ func (p *anonymousNodes) HasPool() bool {
 // affinity key, keeping a conversation on one exit; an empty affinity rotates
 // the starting node round-robin.
 func (p *anonymousNodes) CursorFor(affinity string) anonymousCursor {
+	return p.CursorForOffset(affinity, 0)
+}
+
+// CursorForOffset is CursorFor shifted by offset positions, so a retry pass
+// starts on the exit after the one the previous pass ended on instead of
+// walking back into it.
+func (p *anonymousNodes) CursorForOffset(affinity string, offset int) anonymousCursor {
 	if p == nil || len(p.nodes) == 0 {
 		return anonymousCursor{pool: p}
 	}
@@ -164,6 +176,9 @@ func (p *anonymousNodes) CursorFor(affinity string) anonymousCursor {
 		hash := fnv.New64a()
 		_, _ = hash.Write([]byte(affinity))
 		start = int(hash.Sum64() % uint64(len(p.nodes)))
+	}
+	if n := len(p.nodes); n > 0 {
+		start = ((start+offset)%n + n) % n
 	}
 	return anonymousCursor{pool: p, start: start}
 }
@@ -321,8 +336,6 @@ func (c *anonymousCursor) Next() *anonymousNode {
 		}
 	}
 	choice := -1
-	var earliest int64
-	choiceHealthy := false
 	for step := range n {
 		idx := (c.start + step) % n
 		if c.used[idx] {
@@ -332,15 +345,33 @@ func (c *anonymousCursor) Next() *anonymousNode {
 		if isBlocked(node) {
 			continue
 		}
-		healthy := node.proxy.healthy.Load()
-		until := node.cooldownUntil.Load()
-		if choice < 0 || (healthy && !choiceHealthy) || (healthy == choiceHealthy && until < earliest) {
-			choice, earliest, choiceHealthy = idx, until, healthy
+		// Only a node whose cooldown has already expired may be returned
+		// here. Handing back a cooling node defeated the cooldown entirely:
+		// a "hard" Retry-After would be walked past in the same request and
+		// spent again on every later one.
+		if node.cooldownUntil.Load() > now {
+			continue
+		}
+		if choice < 0 {
+			choice = idx
 		}
 	}
 	if choice >= 0 {
 		c.used[choice] = true
 		return c.pool.nodes[choice]
+	}
+	if c.pool.hasPool {
+		// Every remaining node is cooling. A #pool transport draws a new exit
+		// IP per connection, so it is the only fallback that can still make
+		// progress; a static cooling node cannot.
+		for range n {
+			idx := (c.start + c.offset) % n
+			c.offset++
+			node := c.pool.nodes[idx]
+			if node.proxy.pool && !isBlocked(node) {
+				return node
+			}
+		}
 	}
 	return nil
 }
@@ -351,6 +382,7 @@ func (p *anonymousNodes) MarkSuccess(node *anonymousNode) {
 	}
 	node.failures.Store(0)
 	node.cooldownUntil.Store(0)
+	node.quotaCooldown.Store(false)
 }
 
 // RestoreProxy clears cooldowns for anonymous nodes bound to a recovered
@@ -367,6 +399,12 @@ func (p *anonymousNodes) RestoreProxy(proxy *proxyTransport) int {
 		if node.proxy != proxy {
 			continue
 		}
+		// A quota cooldown is the upstream's answer about this egress, not a
+		// symptom of a broken route: clearing it on recovery would send the
+		// next request straight back into a spent allowance.
+		if node.quotaCooldown.Load() {
+			continue
+		}
 		if node.cooldownUntil.Load() == 0 && node.failures.Load() == 0 {
 			continue
 		}
@@ -377,21 +415,11 @@ func (p *anonymousNodes) RestoreProxy(proxy *proxyTransport) int {
 	return cleared
 }
 
-// maxAnonymousRetryAfterMultiplier bounds an upstream Retry-After on the
-// anonymous lane to the same 8x ceiling as its exponential backoff. The lane
-// is rate limited per exit IP, and a cooling node is reached only through the
-// cursor's fallback: after every eligible node, and not at all while #pool
-// transports are present, since the cursor then keeps cycling those. A quota
-// response asking for hours would keep the exit demoted long after a network
-// change gave it a fresh allowance. Key lanes keep honoring Retry-After in
-// full.
-const maxAnonymousRetryAfterMultiplier = 8
-
 // MarkFailure cools node down after an error or a 401, 403, 429 or 5xx
 // response; any other response leaves it untouched, and #pool nodes are never
 // cooled. The cooldown doubles with each consecutive failure, from the
-// base cooldown up to 8x, and a longer Retry-After extends it up to that same
-// 8x ceiling.
+// base cooldown up to 8x, and an upstream Retry-After overrides it in full:
+// a quota answer names the exact moment the exit may answer again.
 func (p *anonymousNodes) MarkFailure(node *anonymousNode, resp *http.Response, err error) {
 	if node == nil || (node.proxy != nil && node.proxy.pool) {
 		return
@@ -402,8 +430,13 @@ func (p *anonymousNodes) MarkFailure(node *anonymousNode, resp *http.Response, e
 	failures := node.failures.Add(1)
 	delay := p.cooldown * time.Duration(1<<min(failures-1, 3))
 	if resp != nil {
+		// The free tier answers a spent egress with the seconds left in its
+		// UTC-day bucket, which can be many hours. Honouring it in full is the
+		// only way the exit stops being asked: a shorter cooldown would walk
+		// back onto it and take the same refusal again.
 		if retryAfter := parseRetryAfter(resp.Header.Get("Retry-After")); retryAfter > delay {
-			delay = min(retryAfter, p.cooldown*maxAnonymousRetryAfterMultiplier)
+			delay = retryAfter
+			node.quotaCooldown.Store(true)
 		}
 	}
 	node.cooldownUntil.Store(time.Now().Add(delay).UnixNano())
