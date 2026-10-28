@@ -25,6 +25,10 @@ type probeResult struct {
 	success, attempted, effortRejected bool
 	reason, channel                    string
 	effort                             models.EffortProbe
+	// window holds the free tier's own Retry-After when the upstream refused
+	// because the daily free window is closed. It is not evidence about the
+	// model, so it must not be charged to this model's retry schedule alone.
+	window time.Duration
 }
 
 // resolvedEffort returns the reasoning effort to force on a request for model:
@@ -97,7 +101,16 @@ func (g *Gateway) probeFreeModel(ctx context.Context, model string) probeResult 
 	if !d.AvailableZen || !g.catalog.Supported(model) {
 		return probeResult{reason: "unsupported_probe"}
 	}
-	ids := identity.RequestIDs{Session: identity.CanonicalSessionID("availability:" + model), Project: "opencode2api:default-project"}
+	// A probe is not a conversation. The free tier ledges its quota per project
+	// id and egress, and treats one session id as one continuous conversation,
+	// so a fixed project or a per-model session returns the same bucket on
+	// every sweep: once that bucket is spent, every probe for that model
+	// reports 429 while live traffic on the same egress succeeds. Both signals
+	// are minted per probe for that reason.
+	ids := identity.RequestIDs{
+		Session: identity.CanonicalSessionID("availability:" + model + ":" + identity.RandomID("p", 8)),
+		Project: identity.RandomProjectID(),
+	}
 	type lane struct {
 		key, name, baseURL string
 		client             *http.Client
@@ -188,6 +201,12 @@ func (g *Gateway) probeFreeModel(ctx context.Context, model string) probeResult 
 			}
 			return result
 		}
+		if result.reason == "free_usage_window" {
+			// The tier itself is closed. No other lane or model can answer
+			// until the window reopens, so stop here instead of spending one
+			// more exit per remaining lane.
+			return result
+		}
 		if result.reason != "model_unavailable" {
 			inconclusive = result.reason
 		}
@@ -256,6 +275,12 @@ func (g *Gateway) probeAttempt(parent context.Context, client *http.Client, base
 			result.effortRejected = isEffortRejection(resp.StatusCode, string(body))
 			if isModelUnavailable(resp.StatusCode, string(body)) {
 				result.reason = "model_unavailable"
+			} else if window, ok := freeUsageWindow(resp.StatusCode, body, resp.Header.Get("Retry-After")); ok {
+				// The whole free tier is closed until the window reopens.
+				// That says nothing about this model, so name it apart from
+				// an ordinary 429 and carry the upstream's own deadline.
+				result.reason = "free_usage_window"
+				result.window = window
 			}
 		}
 		return result
@@ -321,6 +346,27 @@ func isModelUnavailable(status int, body string) bool {
 		}
 	}
 	return false
+}
+
+// freeUsageWindow reports whether the response is the free tier's own refusal
+// for a closed daily window, and how long upstream says the window stays shut.
+// The free tier answers every free model with the same FreeUsageLimitError and
+// one shared Retry-After, so this is a statement about the whole tier rather
+// than about the model that was probed.
+func freeUsageWindow(status int, body []byte, retryAfter string) (time.Duration, bool) {
+	if status != 429 {
+		return 0, false
+	}
+	text := strings.ToLower(string(body))
+	closed := strings.Contains(text, "freeusagelimiterror") || strings.Contains(text, "free usage limit")
+	if !closed {
+		return 0, false
+	}
+	window, err := time.ParseDuration(retryAfter + "s")
+	if err != nil || window <= 0 {
+		return 0, true
+	}
+	return window, true
 }
 
 // isEffortRejection reports whether a 400 or 422 error body rejects the

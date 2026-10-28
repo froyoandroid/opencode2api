@@ -51,6 +51,10 @@ type AvailabilityRegistry struct {
 	mu    sync.RWMutex
 	path  string
 	items map[string]Availability
+	// tierWindow is when the free tier's closed daily window reopens, as last
+	// reported by upstream. Every free model shares it, so a model the
+	// registry has never written reports it as its next check too.
+	tierWindow time.Time
 }
 
 // AvailabilityStore loads the registry from path. A missing file starts an
@@ -99,6 +103,12 @@ func (s *AvailabilityRegistry) Get(model string) Availability {
 	defer s.mu.RUnlock()
 	item := s.items[model]
 	item.Model = model
+	// A free model the registry has never written has no schedule of its own;
+	// while the tier is closed it inherits the tier's reopen time, so the
+	// sweep does not spend one exit per unknown model.
+	if _, known := s.items[model]; !known && !s.tierWindow.IsZero() && item.NextCheck.Before(s.tierWindow) {
+		item.NextCheck = s.tierWindow
+	}
 	return item
 }
 
@@ -158,8 +168,39 @@ func (s *AvailabilityRegistry) Restore(model string, now time.Time) error {
 // successful probe stores effort when it names a level and clears the stored
 // level when effort.Reset is set.
 func (s *AvailabilityRegistry) Record(model string, generation uint64, success bool, reason, channel string, now time.Time, effort EffortProbe) error {
+	return s.RecordWindow(model, generation, success, reason, channel, now, effort, 0)
+}
+
+// RecordWindow is Record for a probe that may have been refused by the free
+// tier's closed daily window. window is the upstream Retry-After then; because
+// that refusal is shared by every free model, it becomes the next check for
+// all of them, so a closed window costs one sweep instead of one request per
+// model per hour. A stored manual state still wins. Automatic rechecks due
+// before the window reopens are deferred to it.
+func (s *AvailabilityRegistry) RecordWindow(model string, generation uint64, success bool, reason, channel string, now time.Time, effort EffortProbe, window time.Duration) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.recordLocked(model, generation, success, reason, channel, now, effort); err != nil {
+		return err
+	}
+	if !success && reason == "free_usage_window" && window > 0 {
+		reopen := now.Add(window)
+		s.tierWindow = reopen
+		for name, item := range s.items {
+			if item.Manual || item.Disabled {
+				continue
+			}
+			if item.NextCheck.Before(reopen) {
+				item.NextCheck = reopen
+				s.items[name] = item
+			}
+		}
+	}
+	return s.saveLocked()
+}
+
+// recordLocked stores one probe result. The caller holds s.mu for writing.
+func (s *AvailabilityRegistry) recordLocked(model string, generation uint64, success bool, reason, channel string, now time.Time, effort EffortProbe) error {
 	item := s.items[model]
 	if item.Generation != generation {
 		return nil
@@ -201,7 +242,7 @@ func (s *AvailabilityRegistry) Record(model string, generation uint64, success b
 	}
 	item.NextCheck = now.Add(interval)
 	s.items[model] = item
-	return s.saveLocked()
+	return nil
 }
 
 // saveLocked rewrites the registry file through a temporary file and a rename.

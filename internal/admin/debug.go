@@ -10,6 +10,7 @@ import (
 	"opencode2api/internal/config"
 	"opencode2api/internal/gateway"
 	"opencode2api/internal/httpx"
+	"opencode2api/internal/identity"
 	"opencode2api/internal/jsonutil"
 	modelcatalog "opencode2api/internal/models"
 	"opencode2api/internal/protocol"
@@ -144,6 +145,13 @@ func (a *Server) handleDebugInference(w http.ResponseWriter, r *http.Request) {
 	}
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Accept", "application/json")
+	// A Playground request is not a conversation. Without a session signal the
+	// gateway derives one from the prompt, so replaying the same prompt on
+	// every click resolved to one upstream session and drew on that single
+	// quota bucket until it was spent — after which the bench reported 429
+	// while live traffic succeeded. A per-click session keeps the bench on a
+	// fresh bucket, exactly as a new conversation would.
+	request.Header.Set("x-opencode-session", identity.RandomID("playground", 24))
 	recorder := debugResponseRecorder()
 	started := time.Now()
 	a.manager.Handler().ServeHTTP(recorder, request)

@@ -120,7 +120,7 @@ func (m *RuntimeController) checkFreeModels(ctx context.Context) {
 		// Config changes may replace credentials or endpoints during a probe.
 		m.updateMu.Lock()
 		if m.current.Load() == r {
-			if err := r.availability.Record(item.Model, item.Generation, result.success, result.reason, result.channel, time.Now().UTC(), result.effort); err != nil {
+			if err := r.availability.RecordWindow(item.Model, item.Generation, result.success, result.reason, result.channel, time.Now().UTC(), result.effort, result.window); err != nil {
 				m.logger.Warn("model availability state save failed", "error", err)
 			}
 			m.logger.Info("free model availability checked", "component", "models", "event", "availability_checked", "model", item.Model, "available", result.success, "reason", result.reason, "channel", result.channel)
@@ -129,6 +129,11 @@ func (m *RuntimeController) checkFreeModels(ctx context.Context) {
 		if r.gateway.warp != nil && r.gateway.warp.Snapshot().Cooling > warpCooling {
 			// The probe's 429 retired an exit. Leave the rest of the sweep for
 			// the next tick instead of spending the remaining warm exits.
+			return
+		}
+		if result.reason == "free_usage_window" {
+			// One closed window answers for every free model, and the record
+			// just written pushed them all to the reopen time. Stop sweeping.
 			return
 		}
 	}
