@@ -47,6 +47,13 @@ type RequestIDs struct {
 // provider, preferred key, or anonymous proxy. An official OpenCode session is
 // kept verbatim because the client minted it uniquely.
 func DeriveRequestIDs(r *http.Request, body map[string]any, scope string) RequestIDs {
+	return deriveIDs(r, body, scope, processSalt)
+}
+
+// deriveIDs is DeriveRequestIDs with an explicit process salt, so a test can
+// show that two processes derive different sessions for one signal while one
+// process derives the same session twice.
+func deriveIDs(r *http.Request, body map[string]any, scope, salt string) RequestIDs {
 	signal := jsonutil.FirstString(
 		r.Header.Get("x-opencode-session"),
 		r.Header.Get("x-opencode-session-id"),
@@ -72,10 +79,10 @@ func DeriveRequestIDs(r *http.Request, body map[string]any, scope string) Reques
 	if signal == "" || signal == `{}` {
 		signal = RandomID("fallback", 16)
 	}
-	session := scopedSessionID(scope, signal)
+	session := scopedSessionID(salt, scope, signal)
 	childSession := r.Header.Get("x-opencode-session-id")
 	if childSession != "" {
-		childSession = scopedSessionID(scope, childSession)
+		childSession = scopedSessionID(salt, scope, childSession)
 	}
 	projectSignal := jsonutil.FirstString(r.Header.Get("x-opencode-project"), jsonutil.StringAt(body, "metadata", "project_id"))
 	if projectSignal == "" {
@@ -90,7 +97,7 @@ func DeriveRequestIDs(r *http.Request, body map[string]any, scope string) Reques
 		jsonutil.StringAt(body, "metadata", "parent_session_id"),
 	)
 	if parentSession != "" {
-		parentSession = scopedSessionID(scope, parentSession)
+		parentSession = scopedSessionID(salt, scope, parentSession)
 	}
 	return RequestIDs{
 		Session:       session,
@@ -103,13 +110,19 @@ func DeriveRequestIDs(r *http.Request, body map[string]any, scope string) Reques
 }
 
 // scopedSessionID keeps an official client-minted session verbatim and
-// re-encodes every other signal within the caller's scope.
-func scopedSessionID(scope, signal string) string {
+// re-encodes every other signal within the caller's scope and the process
+// salt. salt scopes the id to this process so a restart stops re-presenting an
+// id the free tier already charged; scope keeps two callers with identical
+// conversations from sharing an upstream session.
+func scopedSessionID(salt, scope, signal string) string {
 	if isOfficialSessionID(signal) {
 		return signal
 	}
 	if scope != "" {
 		signal = scope + "\x00" + signal
+	}
+	if salt != "" {
+		signal = salt + "\x00" + signal
 	}
 	return CanonicalSessionID(signal)
 }
@@ -201,15 +214,38 @@ var descendingTimePartPattern = regexp.MustCompile(`^[0-9a-f]{9}f[c-f][0-9a-f]$`
 
 const base62Alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
+// processSalt is drawn once per process. Synthesized sessions mix it in, so a
+// restart mints a new upstream identity for every conversation instead of
+// re-presenting the ses_… that the free tier has already charged. Within one
+// process it never changes, so conversation affinity, sticky providers, and
+// prompt cache still see one stable session.
+//
+// An official client session is exempt: the client minted it, it identifies
+// the caller's real conversation upstream, and rewriting it would break the
+// client's own resume.
+var processSalt = func() string {
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		panic(fmt.Sprintf("crypto/rand failed: %v", err))
+	}
+	return hex.EncodeToString(buf)
+}()
+
 // CanonicalSessionID returns signal unchanged when it already carries an
 // official OpenCode session minted by the client's Identifier.descending()
 // (preserving upstream prompt-cache affinity). Any other downstream identity
 // (UUIDs, foreign client sessions, legacy gateway sessions, conversation
-// seeds) is deterministically re-encoded into that exact layout — inverted
-// 48-bit millisecond timestamp with counter 1, so the low 12 hex digits are
-// ffe — while keeping the same stable session per conversation. A re-encoded
+// seeds) is re-encoded into that exact layout — inverted 48-bit millisecond
+// timestamp with counter 1, so the low 12 hex digits are ffe — giving that
+// conversation one stable session for the life of the process. A re-encoded
 // session passes the free tier's encoding check where the raw hash shape was
 // rejected with 403 FreeTierError.
+//
+// The hash also mixes in processSalt, so the same conversation restarting the
+// gateway produces a different ses_…: an id the free tier has charged stays
+// charged for its whole bucket, and the only way out is to stop naming it.
+// Within one process the salt is constant, so affinity, sticky providers and
+// prompt cache keep observing one session.
 //
 // The timestamp must also stay plausible. The free tier derives a risk window
 // from it: a session dated more than about a year from now, in either
@@ -225,7 +261,7 @@ func CanonicalSessionID(signal string) string {
 	if isOfficialSessionID(signal) {
 		return signal
 	}
-	sum := sha256.Sum256([]byte("ses\x00" + signal))
+	sum := sha256.Sum256([]byte("ses\x00" + processSalt + "\x00" + signal))
 	timePart := descendingTimePart(time.Now(), sum[:6])
 	randomPart := base62Fixed(new(big.Int).SetBytes(sum[6:16]), 14)
 	return "ses_" + timePart + randomPart
