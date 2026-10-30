@@ -17,10 +17,19 @@ import (
 // and the exit must stay out of the cursor until the block expires.
 var errFreeTierIPBlocked = errors.New("free tier blocked the egress IP")
 
+// errFreeTierQuotaExhausted reports that every WARP exit is under the free
+// tier's quota window. Unlike a single refused exit, no rotation can succeed
+// until the window lapses, so the request is answered rather than retried.
+var errFreeTierQuotaExhausted = errors.New("every WARP egress is under the free-tier quota")
+
 // freeTierBlockedMessage is what a client receives while its exit is blocked.
 // The upstream message tells people to turn off a VPN, which is wrong for a
 // server that egresses through a proxy; this one names the real cause and the
 // two ways out.
+// freeTierQuotaMessage is what a client receives while every WARP exit sits
+// under the free tier's quota window.
+const freeTierQuotaMessage = "Every WARP exit is under OpenCode's free-tier usage limit. Rotation cannot help until the window lapses; wait for the reset or use a paid key."
+
 const freeTierBlockedMessage = "OpenCode is blocking free-model traffic from the IP this gateway leaves from, so retrying now cannot succeed. Route the request through another exit or wait for the block to expire."
 
 // errAnonymousLanePaused reports that the anonymous lane's circuit breaker has

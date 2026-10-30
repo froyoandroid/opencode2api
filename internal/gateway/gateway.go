@@ -383,6 +383,14 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 				wire.WriteError(w, external, http.StatusServiceUnavailable, freeTierBlockedMessage, "free_tier_ip_blocked", ids.Request)
 				return
 			}
+			// Every WARP exit is under the free tier's quota. This is the
+			// same answer the upstream gives, so report it as such: a 429 the
+			// client can pace against, not a 502 that invites an immediate
+			// retry into an unchanged window.
+			if errors.Is(err, errFreeTierQuotaExhausted) {
+				wire.WriteError(w, external, http.StatusTooManyRequests, freeTierQuotaMessage, "free_usage_limit", ids.Request)
+				return
+			}
 			// The anonymous lane's circuit breaker is open. Report the pause
 			// distinctly so the operator does not look for a credential or a
 			// model problem in the upstream error.

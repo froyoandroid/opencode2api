@@ -170,6 +170,13 @@ func (g *Gateway) doWARPAttempt(ctx context.Context, req *http.Request, baseURL,
 		if ctx.Err() != nil {
 			return nil, "", ctx.Err()
 		}
+		// Every exit is under the free tier's quota: rotation cannot help, so
+		// report it as the free-tier window rather than a WARP fault. The
+		// caller then answers 429 with the reset instant instead of burning
+		// the remaining attempt budget on exits known to refuse.
+		if errors.Is(err, warp.ErrQuotaExhausted) {
+			return nil, "", errFreeTierQuotaExhausted
+		}
 		return nil, "", fmt.Errorf("%w: %v", errWARPUnavailable, err)
 	}
 	owned, err := g.newWarpLease(lease, g.warpUsesBun(baseURL, model))

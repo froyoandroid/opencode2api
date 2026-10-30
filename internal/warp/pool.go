@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
 	"net/netip"
 	"sync"
 	"time"
@@ -18,6 +19,16 @@ const DefaultPoolSize = 2
 // rejected out of the pool for this long. The free tier scopes its quota to
 // that block, so a new tunnel inside it would only repeat the same answer.
 const egressCooldown = 30 * time.Minute
+
+// quotaEmbargo is how long an egress that answered the free tier with 429
+// stays skipped. Unlike egressCooldown, which keeps a rejected block out of
+// the ring while it is replaced, this mark survives on the address itself: a
+// replacement that lands inside the same /64 is skipped on Acquire instead of
+// being handed a request it is already known to refuse. It is deliberately
+// short — the upstream's own reset is a UTC-day boundary the pool cannot see,
+// so the mark only has to outlast the burst of retries that follows, not the
+// whole day.
+const quotaEmbargo = 10 * time.Minute
 
 // refillRetryDelay spaces out a failed registration attempt. Successful
 // registrations run back to back in the background.
@@ -36,6 +47,11 @@ const (
 // errDuplicateEgress reports a registration whose public egress block is
 // already active or cooling down.
 var errDuplicateEgress = errors.New("WARP egress is already active or cooling down")
+
+// ErrQuotaExhausted reports that every WARP egress is under the free tier's
+// quota. No rotation can succeed until the window lapses, so the caller must
+// answer the request rather than retry or block.
+var ErrQuotaExhausted = errors.New("every WARP egress is under the free-tier quota")
 
 // scaleDownDelay keeps exits created for a burst hot for a while after the
 // burst, so a following burst reuses them instead of paying for new
@@ -91,13 +107,18 @@ type Pool struct {
 	stack   Stack
 	newExit func(context.Context) (*exit, error)
 
-	mu        sync.Mutex
-	active    []*exit
-	inflight  int
-	waiting   int
-	next      int
-	reserved  map[string]bool
-	cooling   map[string]time.Time
+	mu       sync.Mutex
+	active   []*exit
+	inflight int
+	waiting  int
+	next     int
+	reserved map[string]bool
+	cooling  map[string]time.Time
+	// embargod records an egress the upstream refused as a spent free-tier
+	// quota, with the instant it may be tried again. A quota 429 is scoped to
+	// the egress, so drawing that exit again only repeats the refusal; the
+	// pool skips it until the window lapses rather than rotating into it.
+	embargo   map[string]time.Time
 	changed   chan struct{}
 	closed    bool
 	refilling bool
@@ -235,6 +256,7 @@ func newPool(ctx context.Context, log logger, size int, create func(context.Cont
 		newExit:  create,
 		reserved: make(map[string]bool),
 		cooling:  make(map[string]time.Time),
+		embargo:  make(map[string]time.Time),
 		changed:  make(chan struct{}),
 	}
 	// The first registration gates readiness. Cloudflare can answer it with a
@@ -296,17 +318,40 @@ func (p *Pool) Acquire(ctx context.Context) (*Lease, error) {
 			p.mu.Unlock()
 			return nil, ErrClosed
 		}
+		// Draw the next exit that is neither busy nor under a quota embargo.
+		// Skipping an embargoed /64 is the whole point: drawing it hands the
+		// request to an egress the upstream has already refused, and the
+		// refusal repeats until the window ends.
+		now := time.Now()
+		chosen := -1
+		embargoed := 0
 		for attempts := 0; attempts < len(p.active); attempts++ {
 			index := p.next % len(p.active)
 			p.next = (p.next + 1) % len(p.active)
 			active := p.active[index]
-			if active.addRef() {
-				p.inflight++
-				p.mu.Unlock()
-				// Demand just rose: grow the ring toward it in the background.
-				p.startRefill()
-				return &Lease{pool: p, exit: active}, nil
+			if p.embargoedLocked(active.egressKey(), now) {
+				embargoed++
+				continue
 			}
+			if chosen < 0 && active.addRef() {
+				chosen = index
+			}
+		}
+		if chosen < 0 && len(p.active) > 0 && embargoed == len(p.active) {
+			// Every exit is under the free-tier quota. Waiting cannot help:
+			// no exit will come free before the window lapses, and blocking
+			// until the caller's deadline only turns a fast 429 into a hang.
+			// Report the quota so the caller answers the request instead.
+			p.mu.Unlock()
+			return nil, ErrQuotaExhausted
+		}
+		if chosen >= 0 {
+			active := p.active[chosen]
+			p.inflight++
+			p.mu.Unlock()
+			// Demand just rose: grow the ring toward it in the background.
+			p.startRefill()
+			return &Lease{pool: p, exit: active}, nil
 		}
 		p.waiting++
 		changed := p.changed
@@ -341,7 +386,50 @@ func (p *Pool) Report(lease *Lease, status int, body []byte) {
 	if !rotate {
 		return
 	}
+	if status == http.StatusTooManyRequests {
+		p.embargoExit(lease.exit)
+	}
 	p.penalize(lease.exit, reason)
+}
+
+// embargoExit marks this exit's egress as spent for the free tier's quota
+// window. The exit is being retired anyway; the mark matters because the
+// replacement can land on the same /64, and because a cooling duplicate must
+// not be handed back before the window ends.
+func (p *Pool) embargoExit(e *exit) {
+	key := e.egressKey()
+	if key == "" {
+		return
+	}
+	until := time.Now().Add(quotaEmbargo)
+	p.mu.Lock()
+	p.embargoExitLocked(key, until)
+	p.mu.Unlock()
+	if p.logger != nil {
+		p.logger.Warnf("OpenCode WARP egress %s is under the free-tier quota until %s", key, until.UTC().Format(time.RFC3339))
+	}
+}
+
+// embargoExitLocked records the quota window for one egress. The caller holds
+// p.mu.
+func (p *Pool) embargoExitLocked(key string, until time.Time) {
+	if key == "" {
+		return
+	}
+	p.embargo[key] = until
+}
+
+// embargoedLocked reports whether key is still under a quota refusal.
+func (p *Pool) embargoedLocked(key string, now time.Time) bool {
+	until, ok := p.embargo[key]
+	if !ok {
+		return false
+	}
+	if !until.After(now) {
+		delete(p.embargo, key)
+		return false
+	}
+	return true
 }
 
 // Fail drops an exit that cannot carry traffic even though the upstream never
@@ -692,7 +780,7 @@ func (p *Pool) createExit(ctx context.Context) (*exit, error) {
 				delete(p.cooling, subnet)
 			}
 		}
-		usable := key != "" && !p.reserved[key] && !p.cooling[key].After(now)
+		usable := key != "" && !p.reserved[key] && !p.cooling[key].After(now) && !p.embargoedLocked(key, now)
 		if usable {
 			p.reserved[key] = true
 		}
