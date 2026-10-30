@@ -4,12 +4,16 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"opencode2api/internal/jsonutil"
 )
@@ -317,6 +321,11 @@ type streamToolRenameState struct {
 	decided bool
 	renamed bool
 	pending string
+	// id is the identifier this renamer minted for the tool call, if the
+	// upstream left it out of the fragments. A strict OpenAI client aborts a
+	// turn whose tool-call delta carries no id, so every fragment of one call
+	// must report the same one.
+	id string
 }
 
 // streamToolRenamer rewrites the tool names of one protocol's SSE frames,
@@ -327,6 +336,10 @@ type streamToolRenamer struct {
 	renames  *ToolRenames
 	tools    map[string]*streamToolRenameState
 }
+
+// streamToolCallIDs numbers the tool-call ids this process mints for streams
+// whose upstream fragments carried none, so two calls do not collide.
+var streamToolCallIDs atomic.Uint64
 
 // rewriteFrame rewrites one SSE data payload, which is raw JSON text. Frames
 // that cannot carry a tool name are returned untouched, so only a payload that
@@ -342,7 +355,12 @@ func (renamer *streamToolRenamer) rewriteFrame(raw string) []byte {
 		return RenameResponseTool([]byte(raw), renamer.protocol, renamer.renames)
 	}
 	if !strings.Contains(raw, `"tool_calls"`) {
-		return []byte(raw)
+		// No tool call here, but a previous chunk may have announced one
+		// without a name yet: an empty trailing delta is what leaks through
+		// to a strict client as a call it cannot reconstruct.
+		if !renamer.hasUndecidedCall() {
+			return []byte(raw)
+		}
 	}
 	return renamer.rewriteChatFrame(raw)
 }
@@ -364,13 +382,35 @@ func (renamer *streamToolRenamer) rewriteChatFrame(raw string) []byte {
 			if message == nil {
 				continue
 			}
-			for callIndex, rawCall := range jsonutil.SliceAt(message, "tool_calls") {
+			calls := jsonutil.SliceAt(message, "tool_calls")
+			kept := make([]any, 0, len(calls))
+			for callIndex, rawCall := range calls {
 				call, _ := rawCall.(map[string]any)
 				function, _ := call["function"].(map[string]any)
 				if function == nil {
+					// A call object with no function tells a client nothing.
+					changed = true
 					continue
 				}
 				state := renamer.toolState(fmt.Sprint(jsonutil.FirstAny(call["index"], jsonutil.StringAt(call, "id"), callIndex)))
+				// An upstream may stream a call whose id never arrives, or
+				// repeats it on only some fragments. A strict OpenAI client
+				// aborts the turn on a fragment without one, so the first
+				// fragment that names a call mints the id and every later
+				// fragment of that call reports it. A call already carrying an
+				// id keeps the upstream's.
+				if id, ok := call["id"].(string); ok && id != "" {
+					state.id = id
+				} else if name, ok := function["name"].(string); ok && name != "" {
+					if state.id == "" {
+						state.id = synthesizedToolCallID(state.pending, name)
+					}
+					call["id"] = state.id
+					changed = true
+				} else if state.id != "" {
+					call["id"] = state.id
+					changed = true
+				}
 				if name, ok := function["name"].(string); ok && name != "" {
 					if renamer.applyNameFragment(state, function, name) {
 						changed = true
@@ -385,6 +425,20 @@ func (renamer *streamToolRenamer) rewriteChatFrame(raw string) []byte {
 					}
 					state.decided = true
 				}
+				// A fragment left with no name and no arguments tells a strict
+				// client nothing it can act on, and it is exactly the shape
+				// that aborts a turn ("tool_calls[0]" with only an id). Drop
+				// the whole entry rather than emit a call that cannot start.
+				if emptyToolCall(call, function) {
+					// An upstream that sends an all-null entry has told the
+					// client nothing, whether or not this call minted an id.
+					changed = true
+					continue
+				}
+				kept = append(kept, call)
+			}
+			if len(kept) != len(calls) {
+				message["tool_calls"] = kept
 			}
 		}
 	}
@@ -447,6 +501,43 @@ func (renamer *streamToolRenamer) toolState(key string) *streamToolRenameState {
 	state := &streamToolRenameState{}
 	renamer.tools[key] = state
 	return state
+}
+
+// hasUndecidedCall reports whether some tool call has been seen without its
+// name resolved. A frame that carries no tool call of its own may still be the
+// continuation of such a call, so it is inspected rather than passed through.
+func (renamer *streamToolRenamer) hasUndecidedCall() bool {
+	for _, state := range renamer.tools {
+		if !state.decided {
+			return true
+		}
+	}
+	return false
+}
+
+// synthesizedToolCallID mints the id for a call whose fragments never carried
+// one. The name seeds it so the id is stable for that call within the stream,
+// and a per-stream counter keeps two calls with the same name apart.
+func synthesizedToolCallID(pending, name string) string {
+	streamToolCallIDs.Add(1)
+	seed := pending + "\x00" + name + "\x00" + strconv.FormatUint(streamToolCallIDs.Load(), 10)
+	sum := sha256.Sum256([]byte(seed))
+	return "call_" + hex.EncodeToString(sum[:12])
+}
+
+// emptyToolCall reports whether a fragment carries no name and no arguments,
+// so a client has nothing to append it to or start from.
+func emptyToolCall(call, function map[string]any) bool {
+	if name, ok := function["name"].(string); ok && name != "" {
+		return false
+	}
+	// JSON null decodes as a present key with a nil value. An explicit null is
+	// exactly what the upstream sends in the empty entry this guards against,
+	// so only a non-nil value counts as arguments.
+	if arguments, ok := function["arguments"]; ok && arguments != nil {
+		return false
+	}
+	return true
 }
 
 // streamUsageTracker is an io.Writer that splits a relayed stream into SSE

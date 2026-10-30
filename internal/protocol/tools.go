@@ -14,6 +14,33 @@ import (
 // free tier refuses bodies that still read as another client's session.
 const ClientToolPrefix = "clint_"
 
+// officialToolAliases maps an official OpenCode tool name onto the client tool
+// names that mean the same thing, most specific first. The gateway appends the
+// official tool set to a shaped request and injects the official system
+// prompt, whose text names those tools, so a model answers "shell" or "grep"
+// even though the client never declared them; the client then fails the turn
+// with "No such tool available: shell". An alias resolves only onto a name the
+// client actually declared, so nothing is invented for a client that has no
+// equivalent.
+var officialToolAliases = map[string][]string{
+	"shell":     {"Bash", "Shell", "terminal", "exec", "Execute"},
+	"execute":   {"Bash", "Execute", "Shell", "terminal"},
+	"bash":      {"Bash", "Shell", "terminal"},
+	"read":      {"Read", "read_file", "ReadFile"},
+	"edit":      {"Edit", "apply_patch", "patch", "EditFile"},
+	"patch":     {"apply_patch", "Edit", "patch", "str_replace_editor"},
+	"write":     {"Write", "write_file", "WriteFile"},
+	"glob":      {"Glob", "list_files", "Glob"},
+	"grep":      {"Grep", "search_files", "Search"},
+	"webfetch":  {"WebFetch", "fetch"},
+	"websearch": {"WebSearch", "search_web"},
+	"task":      {"Task", "Agent", "subagent"},
+	"subagent":  {"Task", "Agent", "subagent"},
+	"skill":     {"Skill"},
+	"todowrite": {"TodoWrite", "todo_write"},
+	"question":  {"AskUserQuestion", "ask_user"},
+}
+
 // clientToolDigestLength is how many hex characters of the client name digest
 // a wire name carries. Twelve is far past the collision point for the handful
 // of tools one request declares.
@@ -157,6 +184,28 @@ func (r *ToolRenames) HasLongerPrefix(prefix string) bool {
 	return false
 }
 
+// declaredAlias resolves a name the gateway itself put on the wire (an
+// official OpenCode tool) onto a client tool the request actually declared.
+// The client's exact spelling is preferred, then a case-insensitive match, and
+// a lookup that finds nothing declared reports false so the name passes
+// through untouched rather than being invented.
+func (r *ToolRenames) declaredAlias(name string) (string, bool) {
+	if r == nil {
+		return "", false
+	}
+	for _, candidate := range officialToolAliases[strings.ToLower(name)] {
+		if _, declared := r.toWire[candidate]; declared {
+			return candidate, true
+		}
+		for client := range r.toWire {
+			if strings.EqualFold(client, candidate) {
+				return client, true
+			}
+		}
+	}
+	return "", false
+}
+
 // Resolve maps a tool name the upstream reported back to the name the client
 // declared. It is the response-side counterpart of the wire rename: an exact
 // wire name restores, a clint_ prefix is stripped as a best-effort recovery
@@ -178,6 +227,12 @@ func (r *ToolRenames) Resolve(wire string) (string, bool) {
 	}
 	if _, declared := r.toWire[client]; declared {
 		return client, client != wire
+	}
+	// The official tool set the gateway appends is not in toWire: it is not a
+	// rename, it is the gateway's own vocabulary reaching a client that never
+	// declared it. Resolve it onto the declared equivalent if there is one.
+	if declared, ok := r.declaredAlias(client); ok {
+		return declared, declared != wire
 	}
 	lower := strings.ToLower(client)
 	if match, ok := r.byCase[lower]; ok {

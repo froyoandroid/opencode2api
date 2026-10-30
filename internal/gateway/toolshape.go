@@ -327,6 +327,12 @@ func legacyParameters(entry map[string]any) any {
 // the request stays self-consistent: named tool_choice (including legacy Chat
 // and Responses allowed_tools forms), legacy function_call, and the tool-call
 // history each protocol keeps. String choices pass through untouched.
+//
+// A history entry naming a tool the client never declared — an official name
+// the model imitated, or a mangled digled name a truncated stream left behind —
+// is dropped together with its paired result. Forwarding it teaches the model
+// to keep calling a tool the client cannot dispatch, which is how one failed
+// turn becomes a self-reinforcing loop.
 func rewriteToolReferences(payload map[string]any, protocol wire.Protocol, renames *wire.ToolRenames) {
 	if renames.Empty() {
 		return
@@ -340,6 +346,9 @@ func rewriteToolReferences(payload map[string]any, protocol wire.Protocol, renam
 			container["name"] = wireName
 		}
 	}
+	// dropped collects the call ids whose entries were removed, so their
+	// paired tool results go too. An orphan result is a 400 upstream.
+	dropped := map[string]bool{}
 	renameAllowedTools := func(choice map[string]any) {
 		for _, rawEntry := range jsonutil.SliceAt(choice, "allowed_tools") {
 			if entry, ok := rawEntry.(map[string]any); ok {
@@ -364,6 +373,7 @@ func rewriteToolReferences(payload map[string]any, protocol wire.Protocol, renam
 			if call, ok := message["function_call"].(map[string]any); ok {
 				rename(call)
 			}
+			message["tool_calls"] = keptToolCalls(jsonutil.SliceAt(message, "tool_calls"), renames, dropped)
 			for _, rawCall := range jsonutil.SliceAt(message, "tool_calls") {
 				call, _ := rawCall.(map[string]any)
 				if function, ok := call["function"].(map[string]any); ok {
@@ -389,12 +399,99 @@ func rewriteToolReferences(payload map[string]any, protocol wire.Protocol, renam
 		}
 		for _, rawMessage := range jsonutil.SliceAt(payload, "messages") {
 			message, _ := rawMessage.(map[string]any)
+			content := make([]any, 0)
 			for _, rawBlock := range jsonutil.SliceAt(message, "content") {
 				block, _ := rawBlock.(map[string]any)
-				if jsonutil.StringAt(block, "type") == "tool_use" {
+				switch jsonutil.StringAt(block, "type") {
+				case "tool_use":
+					if !declaredToolName(renames, jsonutil.StringAt(block, "name")) {
+						if id := jsonutil.StringAt(block, "id"); id != "" {
+							dropped[id] = true
+						}
+						continue
+					}
 					rename(block)
+				case "tool_result":
+					if dropped[jsonutil.StringAt(block, "tool_use_id")] {
+						continue
+					}
 				}
+				content = append(content, block)
+			}
+			if len(content) != len(jsonutil.SliceAt(message, "content")) {
+				message["content"] = content
 			}
 		}
 	}
+	if len(dropped) > 0 {
+		dropChatToolResults(payload, dropped)
+		if choice, ok := payload["tool_choice"].(map[string]any); ok && choiceNamesDropped(choice, dropped) {
+			delete(payload, "tool_choice")
+		}
+	}
+}
+
+// keptToolCalls filters one Chat turn's tool_calls, recording the id of every
+// entry whose name the client never declared.
+func keptToolCalls(calls []any, renames *wire.ToolRenames, dropped map[string]bool) []any {
+	if len(calls) == 0 {
+		return calls
+	}
+	kept := make([]any, 0, len(calls))
+	for _, rawCall := range calls {
+		call, _ := rawCall.(map[string]any)
+		function, _ := call["function"].(map[string]any)
+		if !declaredToolName(renames, jsonutil.StringAt(function, "name")) {
+			if id := jsonutil.StringAt(call, "id"); id != "" {
+				dropped[id] = true
+			}
+			continue
+		}
+		kept = append(kept, call)
+	}
+	return kept
+}
+
+// declaredToolName reports whether name is one the client declared, under its
+// own spelling or as an official alias that resolves onto one. Resolve reports
+// a change exactly when it mapped the name onto a declared client tool, so an
+// unknown name cannot be mistaken for a known one.
+func declaredToolName(renames *wire.ToolRenames, name string) bool {
+	if name == "" {
+		return false
+	}
+	if _, ok := renames.Wire(name); ok {
+		return true
+	}
+	_, mapped := renames.Resolve(name)
+	return mapped
+}
+
+// dropChatToolResults removes Chat tool-role messages whose tool_call_id
+// belongs to a dropped call.
+func dropChatToolResults(payload map[string]any, dropped map[string]bool) {
+	messages := jsonutil.SliceAt(payload, "messages")
+	if len(messages) == 0 {
+		return
+	}
+	kept := make([]any, 0, len(messages))
+	for _, raw := range messages {
+		message, _ := raw.(map[string]any)
+		if jsonutil.StringAt(message, "role") == "tool" && dropped[jsonutil.StringAt(message, "tool_call_id")] {
+			continue
+		}
+		kept = append(kept, message)
+	}
+	if len(kept) != len(messages) {
+		payload["messages"] = kept
+	}
+}
+
+// choiceNamesDropped reports whether a named tool_choice points at a tool the
+// client never declared, in which case the whole choice is removed.
+func choiceNamesDropped(choice map[string]any, dropped map[string]bool) bool {
+	if function, ok := choice["function"].(map[string]any); ok {
+		choice = function
+	}
+	return dropped[jsonutil.StringAt(choice, "name")]
 }
