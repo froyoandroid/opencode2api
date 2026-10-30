@@ -145,13 +145,11 @@ func (a *Server) handleDebugInference(w http.ResponseWriter, r *http.Request) {
 	}
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Accept", "application/json")
-	// A Playground request is not a conversation. Without a session signal the
-	// gateway derives one from the prompt, so replaying the same prompt on
-	// every click resolved to one upstream session and drew on that single
-	// quota bucket until it was spent — after which the bench reported 429
-	// while live traffic succeeded. A per-click session keeps the bench on a
-	// fresh bucket, exactly as a new conversation would.
-	request.Header.Set("x-opencode-session", identity.RandomID("playground", 24))
+	// A Playground request is not a conversation: it replays the same prompt on
+	// every click, so a session derived from the prompt stays one bucket until
+	// it is charged and every later click answers 429 while live traffic
+	// succeeds. A fresh session per click keeps the bench on its own bucket.
+	request.Header.Set("x-opencode-session", benchSession())
 	recorder := debugResponseRecorder()
 	started := time.Now()
 	a.manager.Handler().ServeHTTP(recorder, request)
@@ -308,4 +306,10 @@ func sensitiveDebugKey(key string) bool {
 		}
 	}
 	return false
+}
+
+// benchSession returns a fresh upstream session for one Playground request. It
+// is canonical so the gateway forwards it verbatim instead of re-encoding it.
+func benchSession() string {
+	return identity.CanonicalSessionID(identity.RandomID("playground", 16))
 }

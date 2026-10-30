@@ -92,6 +92,21 @@ func probePayload(model string, protocol wire.Protocol, effort string, v1 bool) 
 // effort it accepts on this protocol. The reason is model_unavailable only
 // when every lane reported it; any other failure keeps the result
 // inconclusive.
+// probeRequestIDs returns the upstream identity of one probe. A probe is not a
+// conversation, so it must not present a pinned one: a fixed project id and a
+// session derived from the model name are one bucket shared with every
+// deployment that runs the same probe, and once that bucket is charged on a
+// popular exit the probe answers 429 while live traffic on the same process and
+// egress succeeds. Fresh identity per probe keeps each check on its own bucket;
+// the availability cache already holds the answer for the next interval, so
+// nothing is gained by reusing one.
+func probeRequestIDs() identity.RequestIDs {
+	return identity.RequestIDs{
+		Session: identity.CanonicalSessionID(identity.RandomID("availability", 16)),
+		Project: identity.RandomProjectID(),
+	}
+}
+
 func (g *Gateway) probeFreeModel(ctx context.Context, model string) probeResult {
 	if !g.catalog.IsFreeModel(model) {
 		return probeResult{reason: "not_free"}
@@ -101,16 +116,7 @@ func (g *Gateway) probeFreeModel(ctx context.Context, model string) probeResult 
 	if !d.AvailableZen || !g.catalog.Supported(model) {
 		return probeResult{reason: "unsupported_probe"}
 	}
-	// A probe is not a conversation. The free tier ledges its quota per project
-	// id and egress, and treats one session id as one continuous conversation,
-	// so a fixed project or a per-model session returns the same bucket on
-	// every sweep: once that bucket is spent, every probe for that model
-	// reports 429 while live traffic on the same egress succeeds. Both signals
-	// are minted per probe for that reason.
-	ids := identity.RequestIDs{
-		Session: identity.CanonicalSessionID("availability:" + model + ":" + identity.RandomID("p", 8)),
-		Project: identity.RandomProjectID(),
-	}
+	ids := probeRequestIDs()
 	type lane struct {
 		key, name, baseURL string
 		client             *http.Client

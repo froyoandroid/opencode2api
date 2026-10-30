@@ -22,8 +22,8 @@ func signalRequest(session string) (*http.Request, map[string]any) {
 // so the same conversation under two process salts derives two ids.
 func TestSessionIDDiffersAcrossProcessSalts(t *testing.T) {
 	r, body := signalRequest("")
-	before := deriveIDs(r, body, "scope", "salt-a").Session
-	after := deriveIDs(r, body, "scope", "salt-b").Session
+	before := deriveIDs(r, body, "scope", []byte("salt-a")).Session
+	after := deriveIDs(r, body, "scope", []byte("salt-b")).Session
 	if before == after {
 		t.Fatalf("restart derived the same session %s: the burned id survives", before)
 	}
@@ -37,8 +37,8 @@ func TestSessionIDDiffersAcrossProcessSalts(t *testing.T) {
 func TestSessionIDStableWithinOneProcess(t *testing.T) {
 	firstRequest, firstBody := signalRequest("")
 	secondRequest, secondBody := signalRequest("")
-	first := deriveIDs(firstRequest, firstBody, "scope", "salt-a").Session
-	second := deriveIDs(secondRequest, secondBody, "scope", "salt-a").Session
+	first := deriveIDs(firstRequest, firstBody, "scope", []byte("salt-a")).Session
+	second := deriveIDs(secondRequest, secondBody, "scope", []byte("salt-a")).Session
 	if first != second {
 		t.Fatalf("one process derived %s then %s for one conversation", first, second)
 	}
@@ -49,10 +49,10 @@ func TestSessionIDStableWithinOneProcess(t *testing.T) {
 func TestOfficialSessionForwardedVerbatim(t *testing.T) {
 	const official = "ses_e7d96c721ffefIaGgHjKlMnOpQ"
 	r, body := signalRequest(official)
-	if got := deriveIDs(r, body, "scope", "salt-a").Session; got != official {
+	if got := deriveIDs(r, body, "scope", []byte("salt-a")).Session; got != official {
 		t.Fatalf("official session rewritten to %s", got)
 	}
-	if got := deriveIDs(r, body, "scope", "salt-b").Session; got != official {
+	if got := deriveIDs(r, body, "scope", []byte("salt-b")).Session; got != official {
 		t.Fatalf("official session rewritten to %s under a different salt", got)
 	}
 }
@@ -63,7 +63,7 @@ func TestChildSessionForwardedVerbatim(t *testing.T) {
 	const child = "ses_9a8626a2bffekXyZaBcDeFgHiJ"
 	r, body := signalRequest("ses_1234567890abfeedcba987654321YX")
 	r.Header.Set("x-opencode-session-id", child)
-	ids := deriveIDs(r, body, "scope", "salt-a")
+	ids := deriveIDs(r, body, "scope", []byte("salt-a"))
 	if ids.ChildSession != child {
 		t.Fatalf("child session rewritten to %s", ids.ChildSession)
 	}
@@ -79,8 +79,8 @@ func TestChildSessionForwardedVerbatim(t *testing.T) {
 func TestScopeStillSeparatesCallers(t *testing.T) {
 	aRequest, aBody := signalRequest("")
 	bRequest, bBody := signalRequest("")
-	a := deriveIDs(aRequest, aBody, "caller-a", "salt")
-	b := deriveIDs(bRequest, bBody, "caller-b", "salt")
+	a := deriveIDs(aRequest, aBody, "caller-a", []byte("salt"))
+	b := deriveIDs(bRequest, bBody, "caller-b", []byte("salt"))
 	if a.Session == b.Session {
 		t.Fatalf("two callers shared session %s", a.Session)
 	}
